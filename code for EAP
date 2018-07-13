@@ -1,0 +1,212 @@
+FYI.
+
+From: Mariappan, Kannan [GCB-OT NE] 
+Sent: 2018年7月13日 19:18
+To: Yan, Jiapei [GCB-OT]
+Subject: /data/1/gcgmya/bin/apps/EPP/scripts/runEPPTXNDaily.ksh 
+
+
+
+#!/bin/ksh
+
+start=`date +%s`;
+FID=`whoami`;
+. /home/$FID/EPP/eppProfile.ksh
+
+if [[ $# -ne 6 ]]
+then
+  echo "Usage: $0 JOB_NAME RUN_MODE PROC_MODE TRIGGER COUNTRY_CODE AS_OF_DATE"
+  exit 1
+fi
+
+echo "EAP: ****************************************************";
+echo "EAP: Starting execution for $0";
+echo "EAP: ****************************************************";
+
+EPP_JARS=$APP_DIR/jars;
+EPP_BIN=$APP_DIR/scripts;
+EPP_MODEL=$APP_DIR/Model;
+JOB_NAME=$1;
+RUN_MODE=$2;
+PROC_MODE=$3;
+TRIGGER=$4;
+COUNTRY_CODE=$5;
+AS_OF_DATE=$6;
+export RUNDATE=`echo "${AS_OF_DATE}"| awk 'BEGIN {OFS="-"} {print substr($1,1,4), substr($1,5,2), substr($1,7,2)}'`
+NUM_ITERATIONS=2;
+export hdfsOut=$HDFS_BASE_URL/Out/$COUNTRY_CD/$AS_OF_DATE;
+
+export PYLIB_HOME=${EPP_MODEL}/TXNlib/
+export JOBLIB=${EPP_MODEL}/Execution/${RUNDATE}_TXN
+export hdfsOut=$HDFS_BASE_URL/Out/$COUNTRY_CD/$RUNDATE/TXN;
+
+mkdir -p ${JOBLIB}
+cp -f ${PYLIB_HOME}/*.* ${JOBLIB}/
+
+#Kerberos authentication
+$APP_DIR/scripts/doKinit.ksh;
+if [ $? != 0 ];
+then
+  echo "ERROR: Unable to complete Kerberos authentication ... exiting";
+  exit 1;
+fi
+
+echo "EAP: Starting Spark execution at `date`";
+
+#Initializing Spark environment
+sh $ENV_PATH/spark-env.sh;
+
+if [[ $PROC_MODE = "Local" ]]; then
+        EXEC_MODE=yarn-client;
+else
+        TRIGGER_PATH=${HDFS_MASTER_URL}${HDFS_BASE_URL}/Trigger;
+        EXEC_MODE=yarn;
+fi
+
+EXEC_HOST=`hostname`;
+if [[ "$DEV_SERVERS" == *"$EXEC_HOST"* ]];
+  then EXEC_ENV=Dev;
+  AW_PROP='eap2-aw-service-dev.properties'
+elif [[ "$UAT_SERVERS" == *"$EXEC_HOST"* ]];
+  then 
+  EXEC_ENV=UAT;
+  AW_PROP='eap2-aw-service-uat.properties'
+elif [[ "$PROD_SERVERS" == *"$EXEC_HOST"* ]];
+  then 
+  EXEC_ENV=Prod;
+  AW_PROP='eap2-aw-service-prod.properties'
+fi
+
+if [[ $JOB_NAME == "EPPTXNExtract" ]];
+then
+CLASS_NAME=$1;
+echo "EAP: 'Executing ==> spark-submit EPP Variables extract for Model Execution for AS-OF-Date $RUNDATE'";
+java -jar ${EPP_JARS}/eap2-aw-service-jar-with-dependencies.jar run.type=response aw.prop.file=$AW_PROP aw.trigger.file=$TRIGGER aw.output.fileID.file1Path=${PARTITION_DIR} aw.response.type=Started
+echo "$EXEC_MODE $RUN_OPTIONS --driver-java-options "-XX:PermSize=256m -XX:MaxPermSize=4096m" $APP_DIR/scripts/epp_txn_read_data_spark.py"
+
+spark2-submit --master $EXEC_MODE $RUN_OPTIONS --driver-java-options "-XX:PermSize=256m -XX:MaxPermSize=4096m" $APP_DIR/scripts/epp_txn_read_data_spark.py;
+
+STATUS=$?;
+
+elif [[ $JOB_NAME == "EPPTXNModelScore" ]];
+then
+CLASS_NAME=$1;
+echo "EAP: 'Executing ==> EPP Transaction Scoring Model for AS-OF-Date $RUNDATE'";
+
+java -jar ${EPP_JARS}/eap2-aw-service-jar-with-dependencies.jar run.type=response aw.prop.file=$AW_PROP aw.trigger.file=$TRIGGER aw.output.fileID.file1Path=${PARTITION_DIR} aw.response.type=Started
+#extract data from HDFS to JOBLIB
+hadoop fs -text ${hdfsOut}/txn_details.csv/* > $JOBLIB/txn_details.csv
+if [[ -s ${JOBLIB}/txn_details.csv ]] ; then
+echo "Data extracted for txn_details";
+else
+echo "txn_data extract is empty. Model cannot run. exiting";
+exit 1;
+fi
+hadoop fs -text ${hdfsOut}/acct_base.csv/* > $JOBLIB/acct_base.csv
+if [[ -s ${JOBLIB}/acct_base.csv ]] ; then
+echo "Data extracted for acct_base";
+else
+echo "acct_base extract is empty. Model cannot run. exiting";
+exit 1;
+fi
+hadoop fs -text ${hdfsOut}/dev_adl_my_final.csv/* > $JOBLIB/dev_adl_my_final.csv
+if [[ -s ${JOBLIB}/dev_adl_my_final.csv ]] ; then
+echo "Data extracted for dev_adl_my_final";
+else
+echo "dev_adl_my_final extract is empty. Model cannot run. exiting";
+exit 1;
+fi
+hadoop fs -text ${hdfsOut}/segment_base.csv/* > $JOBLIB/segment_base.csv
+if [[ -s ${JOBLIB}/segment_base.csv ]] ; then
+echo "Data extracted for segment_base.csv";
+else
+echo "segment_base extract is empty. Model cannot run. exiting";
+exit 1;
+fi
+
+java -jar ${EPP_JARS}/eap2-aw-service-jar-with-dependencies.jar run.type=response aw.prop.file=$AW_PROP aw.trigger.file=$TRIGGER aw.output.fileID.file1Path=${PARTITION_DIR} aw.response.type=RunModel
+#Run Model
+${PYTHON_HOME}/bin/python $APP_DIR/scripts/epp_txn_run_model_final.py
+if [ $? != 0 ];
+then
+  echo "ERROR: Unable to complete Scoring by Model for AS OF DATE $RUNDATE....Exiting";
+  exit 1;
+fi
+
+#Post output to Hive Table
+hadoop fs -mkdir ${HDFS_APP_BASE}/EAP_EPP_MODEL_OUTPUT_D/mis_dt=${RUNDATE}
+hadoop fs -copyFromLocal -f ${JOBLIB}/EPP_TXN_MY_63seg.csv ${HDFS_APP_BASE}/EAP_EPP_MODEL_OUTPUT_D/mis_dt=${RUNDATE}/
+beeline -u ${HIVE_URL} -e "msck repair table EAP_EPP_MODEL_OUTPUT_D"
+if [ $? != 0 ];
+then
+  echo "ERROR: Unable to add model output to Hive Table for AOD: $RUNDATE";
+  exit 1;
+fi
+#Final Output
+
+#beeline -u ${HIVE_URL} --hivevar RUNDATE=${RUNDATE} -f ${APP_DIR}/scripts/stmt_final_output.hql > $JOBLIB/stmt_final_output.log
+#if [ $? != 0 ];
+#then
+#  echo "ERROR: Unable to Load EPP STATEMENT Customer Segment  to Final EPP Table for AOD: $RUNDATE";
+#  exit 1;
+#fi
+#Cleanup and archive files;
+zip -rm ${EPP_MODEL}/Execution/${RUNDATE}_TXN.zip ${EPP_MODEL}/Execution/${RUNDATE}_TXN ;
+if [ $? != 0 ];
+then
+  echo "ERROR: Cleanup and ZIP failure for AOD: $RUNDATE";
+  exit 1;
+fi
+hadoop fs -moveFromLocal -f ${EPP_MODEL}/Execution/${RUNDATE}_TXN.zip ${hdfsOut}/ ;
+if [ $? != 0 ];
+then
+  echo "ERROR: Archival to HDFS failure for AOD: $RUNDATE";
+  exit 1;
+fi
+STATUS=$?;
+
+else
+CLASS_NAME=EPPSpark$1;
+echo "EAP: Test job";
+java -jar ${EPP_JARS}/eap2-aw-service-jar-with-dependencies.jar run.type=response aw.prop.file=$AW_PROP aw.trigger.file=$TRIGGER aw.output.fileID.file1Path=${PARTITION_DIR} aw.response.type=Started
+sleep 40
+STATUS=$?;
+fi
+
+if [[ $STATUS == "0" ]];
+  then 
+  EXEC_STATUS=Success;
+  #Profile update to latest model date
+  java -jar ${EPP_JARS}/eap2-aw-service-jar-with-dependencies.jar run.type=response aw.prop.file=$AW_PROP aw.trigger.file=$TRIGGER aw.output.fileID.file1Path=${PARTITION_DIR} aw.response.type=Completed
+  
+  else EXEC_STATUS=FAILED;
+  java -jar ${EPP_JARS}/eap2-aw-service-jar-with-dependencies.jar run.type=response aw.prop.file=$AW_PROP aw.trigger.file=$TRIGGER aw.output.fileID.file1Path=${PARTITION_DIR} aw.response.type=Failed
+  
+fi
+
+
+EXEC_HOST=`hostname`;
+if [[ "$DEV_SERVERS" == *"$EXEC_HOST"* ]];
+  then EXEC_ENV=Dev;
+elif [[ "$UAT_SERVERS" == *"$EXEC_HOST"* ]];
+  then EXEC_ENV=UAT;
+elif [[ "$PROD_SERVERS" == *"$EXEC_HOST"* ]];
+  then EXEC_ENV=Prod;
+fi
+
+echo "EAP: `date`: Spark execution completed with $EXEC_STATUS $EXEC_HOST $EXEC_ENV $COUNTRY_CODE $AS_OF_DATE $JOB_NAME $CLASS_NAME $TRIGGER";
+
+mailx -r "EAP2-GCG-EPP@`hostname`" -s "$EXEC_ENV $EXEC_STATUS: EAP2 GCG-EPP-$COUNTRY_CODE $JOB_NAME $AS_OF_DATE" "$EMAIL_LIST"  << EOF
+Execution status: $EXEC_STATUS
+Country Code: $COUNTRY_CODE
+As of Date: $AS_OF_DATE
+Job Name: $JOB_NAME
+Job Class: $CLASS_NAME
+AW Trigger: `basename $TRIGGER`
+Date: `date`
+Server: $FID @ `hostname`
+Run Time: $((($(date +%s)-$start+30)/60)) minutes
+EOF
+
+echo "EAP: Mail send status: $?"
+
